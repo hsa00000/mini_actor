@@ -1,7 +1,17 @@
 [package]
 name = "mini_actor"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "The smallest, simplest Rust actor model using Tokio runtime"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hsa00000/mini_actor"
+keywords = ["actor", "tokio", "async"]
+categories = ["asynchronous", "runtime"]
 
 [dependencies]
 tokio = { version = "1.46.1", features = ["full"] }
+
+[dev-dependencies]
+rayon = "1.10.0"
+tokio-rayon = "2.1.0"
