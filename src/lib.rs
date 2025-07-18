@@ -597,3 +597,591 @@ impl Actor {
         rx_oneshot.await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::runtime::Builder;
+    use tokio::time::{sleep, timeout};
+
+    static TEST_RT: OnceLock<Runtime> = OnceLock::new();
+
+    fn get_test_runtime() -> &'static Runtime {
+        TEST_RT.get_or_init(|| {
+            Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        })
+    }
+
+    // Test task implementations
+    #[derive(Debug, Clone)]
+    struct SimpleTask {
+        id: u32,
+        value: String,
+    }
+
+    impl Task for SimpleTask {
+        type Output = String;
+
+        async fn run(self) -> Self::Output {
+            format!("Task {} completed with value: {}", self.id, self.value)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DelayedTask {
+        id: u32,
+        delay_ms: u64,
+    }
+
+    impl Task for DelayedTask {
+        type Output = u32;
+
+        async fn run(self) -> Self::Output {
+            sleep(Duration::from_millis(self.delay_ms)).await;
+            self.id
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PanicTask;
+
+    impl Task for PanicTask {
+        type Output = String;
+
+        async fn run(self) -> Self::Output {
+            panic!("This task panics intentionally");
+        }
+    }
+
+    // Batch task implementations
+    #[derive(Debug, Clone)]
+    struct CounterTask {
+        counter: Arc<AtomicUsize>,
+        increment: usize,
+    }
+
+    impl BatchTask for CounterTask {
+        async fn batch_run(list: Vec<Self>) {
+            if list.is_empty() {
+                return;
+            }
+
+            let counter = &list[0].counter;
+            let total_increment: usize = list.iter().map(|task| task.increment).sum();
+
+            counter.fetch_add(total_increment, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LogTask {
+        message: String,
+        log_storage: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BatchTask for LogTask {
+        async fn batch_run(list: Vec<Self>) {
+            if list.is_empty() {
+                return;
+            }
+
+            let log_storage = list[0].log_storage.clone();
+            let mut storage = log_storage.lock().unwrap();
+
+            for task in list {
+                storage.push(format!("BATCH: {}", task.message));
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DelayedBatchTask {
+        id: u32,
+        delay_ms: u64,
+        results: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl BatchTask for DelayedBatchTask {
+        async fn batch_run(list: Vec<Self>) {
+            if list.is_empty() {
+                return;
+            }
+
+            let results = list[0].results.clone();
+            let delay_ms = list[0].delay_ms;
+
+            sleep(Duration::from_millis(delay_ms)).await;
+
+            let mut results_guard = results.lock().unwrap();
+            for task in list {
+                results_guard.push(task.id);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PanicBatchTask;
+
+    impl BatchTask for PanicBatchTask {
+        async fn batch_run(_list: Vec<Self>) {
+            panic!("This batch task panics intentionally");
+        }
+    }
+
+    // Test Actor::new
+    #[test]
+    fn test_actor_new() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        // Verify actor is created successfully
+        assert_eq!(actor.batch_senders.len(), 0);
+    }
+
+    // Test execute_waiting with simple task
+    #[test]
+    fn test_execute_waiting_simple() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let task = SimpleTask {
+                id: 1,
+                value: "test".to_string(),
+            };
+            actor.execute_waiting(task).await
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Task 1 completed with value: test");
+    }
+
+    // Test execute_waiting with delayed task
+    #[test]
+    fn test_execute_waiting_delayed() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let task = DelayedTask {
+                id: 42,
+                delay_ms: 50,
+            };
+            actor.execute_waiting(task).await
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    // Test execute_waiting with panic task
+    #[test]
+    fn test_execute_waiting_panic() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let task = PanicTask;
+            actor.execute_waiting(task).await
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_panic());
+    }
+
+    // Test execute_detached
+    #[test]
+    fn test_execute_detached() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let task = SimpleTask {
+                id: 2,
+                value: "detached".to_string(),
+            };
+            let handle = actor.execute_detached(task);
+            handle.await
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Task 2 completed with value: detached");
+    }
+
+    // Test execute_detached with panic
+    #[test]
+    fn test_execute_detached_panic() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let task = PanicTask;
+            let handle = actor.execute_detached(task);
+            handle.await
+        });
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_panic());
+    }
+
+    // Test execute_batch_detached
+    #[test]
+    fn test_execute_batch_detached() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // Send multiple batch tasks
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 1,
+            });
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 2,
+            });
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 3,
+            });
+
+            // Wait a bit for processing
+            sleep(Duration::from_millis(100)).await;
+        });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+    }
+
+    // Test execute_batch_waiting
+    #[test]
+    fn test_execute_batch_waiting() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let result = rt.block_on(async {
+            // Send some detached tasks first
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 5,
+            });
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 10,
+            });
+
+            // Send a waiting task - this should batch with the above
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 15,
+                })
+                .await
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 30);
+    }
+
+    // Test batch processing with log storage
+    #[test]
+    fn test_batch_processing_with_storage() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let log_storage = Arc::new(Mutex::new(Vec::new()));
+
+        rt.block_on(async {
+            // Send multiple log tasks
+            actor.execute_batch_detached(LogTask {
+                message: "First log".to_string(),
+                log_storage: log_storage.clone(),
+            });
+            actor.execute_batch_detached(LogTask {
+                message: "Second log".to_string(),
+                log_storage: log_storage.clone(),
+            });
+
+            // Wait for a batch to complete
+            actor
+                .execute_batch_waiting(LogTask {
+                    message: "Third log".to_string(),
+                    log_storage: log_storage.clone(),
+                })
+                .await
+                .unwrap();
+        });
+
+        let logs = log_storage.lock().unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs.contains(&"BATCH: First log".to_string()));
+        assert!(logs.contains(&"BATCH: Second log".to_string()));
+        assert!(logs.contains(&"BATCH: Third log".to_string()));
+    }
+
+    // Test delayed batch processing
+    #[test]
+    fn test_delayed_batch_processing() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let results = Arc::new(Mutex::new(Vec::new()));
+
+        let result = rt.block_on(async {
+            timeout(
+                Duration::from_millis(500),
+                actor.execute_batch_waiting(DelayedBatchTask {
+                    id: 1,
+                    delay_ms: 100,
+                    results: results.clone(),
+                }),
+            )
+            .await
+        });
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+
+        let results_guard = results.lock().unwrap();
+        assert_eq!(results_guard.len(), 1);
+        assert_eq!(results_guard[0], 1);
+    }
+
+    // Test multiple different batch task types
+    #[test]
+    fn test_multiple_batch_types() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let log_storage = Arc::new(Mutex::new(Vec::new()));
+
+        rt.block_on(async {
+            // Submit different types of batch tasks
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 100,
+            });
+            actor.execute_batch_detached(LogTask {
+                message: "Mixed batch test".to_string(),
+                log_storage: log_storage.clone(),
+            });
+
+            // Wait for both to complete
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 200,
+                })
+                .await
+                .unwrap();
+            actor
+                .execute_batch_waiting(LogTask {
+                    message: "Mixed batch test 2".to_string(),
+                    log_storage: log_storage.clone(),
+                })
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 300);
+        let logs = log_storage.lock().unwrap();
+        assert_eq!(logs.len(), 2);
+    }
+
+    // Test concurrent task execution
+    #[test]
+    fn test_concurrent_execution() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            let mut handles = Vec::new();
+
+            // Start multiple tasks concurrently
+            for i in 0..10 {
+                let handle = actor.execute_detached(DelayedTask {
+                    id: i,
+                    delay_ms: 20,
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all tasks to complete
+            let mut results = Vec::new();
+            for handle in handles {
+                results.push(handle.await.unwrap());
+            }
+
+            results.sort();
+            results
+        });
+
+        assert_eq!(result.len(), 10);
+        assert_eq!(result, (0..10).collect::<Vec<_>>());
+    }
+
+    // Test error handling in batch processing
+    #[test]
+    fn test_batch_error_handling() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+
+        let result = rt.block_on(async {
+            timeout(
+                Duration::from_millis(500),
+                actor.execute_batch_waiting(PanicBatchTask),
+            )
+            .await
+        });
+
+        // The batch processor should panic, causing the oneshot receiver to be dropped
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+    }
+
+    // Test that batch processors are reused
+    #[test]
+    fn test_batch_processor_reuse() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // First batch
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 1,
+                })
+                .await
+                .unwrap();
+
+            // Second batch - should reuse the same processor
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 2,
+                })
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        // Verify that only one batch processor was created
+        assert_eq!(actor.batch_senders.len(), 1);
+    }
+
+    // Test empty batch handling
+    #[test]
+    fn test_empty_batch_handling() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Create a batch task that handles empty lists
+        #[derive(Debug, Clone)]
+        struct EmptyBatchTask {
+            counter: Arc<AtomicUsize>,
+        }
+
+        impl BatchTask for EmptyBatchTask {
+            async fn batch_run(list: Vec<Self>) {
+                if list.is_empty() {
+                    return;
+                }
+                list[0].counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let result = rt.block_on(async {
+            actor
+                .execute_batch_waiting(EmptyBatchTask {
+                    counter: counter.clone(),
+                })
+                .await
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    // Test high volume batch processing
+    #[test]
+    fn test_high_volume_batch_processing() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // Submit many batch tasks quickly
+            for i in 0..100 {
+                actor.execute_batch_detached(CounterTask {
+                    counter: counter.clone(),
+                    increment: i,
+                });
+            }
+
+            // Wait for processing to complete
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 0,
+                })
+                .await
+                .unwrap();
+        });
+
+        // Sum of 0 to 99 is 4950
+        assert_eq!(counter.load(Ordering::SeqCst), 4950);
+    }
+
+    // Test mixed execution patterns
+    #[test]
+    fn test_mixed_execution_patterns() {
+        let rt = get_test_runtime();
+        let actor = Actor::new(rt);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // Mix of individual and batch tasks
+            let individual_handle = actor.execute_detached(DelayedTask {
+                id: 999,
+                delay_ms: 50,
+            });
+
+            actor.execute_batch_detached(CounterTask {
+                counter: counter.clone(),
+                increment: 10,
+            });
+
+            let individual_result = individual_handle.await.unwrap();
+            assert_eq!(individual_result, 999);
+
+            actor
+                .execute_batch_waiting(CounterTask {
+                    counter: counter.clone(),
+                    increment: 20,
+                })
+                .await
+                .unwrap();
+
+            let batch_result = actor
+                .execute_waiting(SimpleTask {
+                    id: 777,
+                    value: "mixed".to_string(),
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(batch_result, "Task 777 completed with value: mixed");
+        });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 30);
+    }
+}
