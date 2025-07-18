@@ -16,3 +16,15 @@ tokio = { version = "1.46.1", features = ["full"] }
 [dev-dependencies]
 rayon = "1.10.0"
 tokio-rayon = "2.1.0"
+
+[[example]]
+name = "individual_task"
+path = "examples/individual_task.rs"
+
+[[example]]
+name = "batch_logging"
+path = "examples/batch_logging.rs"
+
+[[example]]
+name = "database_batch"
+path = "examples/database_batch.rs"
