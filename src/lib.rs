@@ -544,7 +544,7 @@ impl TaskExecutor {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn execute_batch_waiting<BT: BatchTask + Clone>(
+    pub async fn execute_batch_waiting<BT: BatchTask>(
         &self,
         batch_task: BT,
     ) -> Result<(), oneshot::error::RecvError> {
