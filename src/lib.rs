@@ -440,7 +440,7 @@ impl TaskExecutor {
     /// });
     /// # }
     /// ```
-    pub fn execute_batch_detached<BT: BatchTask + Clone>(&self, batch_task: BT) {
+    pub fn execute_batch_detached<BT: BatchTask>(&self, batch_task: BT) {
         let key = TypeId::of::<BT>();
         if let Some(sender_any) = self.batch_senders.get(&key) {
             let sender = sender_any
