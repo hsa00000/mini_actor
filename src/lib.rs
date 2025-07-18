@@ -1,89 +1,105 @@
+#![allow(dead_code)]
+
 //! # mini_actor
 //!
 //! A minimalist, lightweight, and intuitive actor-like library for Rust, designed to work seamlessly with the Tokio runtime.
 //!
 //! This crate offers a simple and ergonomic API to spawn asynchronous tasks, manage their lifecycle, and retrieve their results.
-//! Whether you need to wait for a task to complete for synchronous-style control flow or execute it in a "fire-and-forget"
-//! manner, `mini_actor` provides a straightforward solution.
+//! It supports both individual task execution and efficient batch processing. Whether you need to wait for a task to complete
+//! for synchronous-style control flow, execute it in a "fire-and-forget" manner, or group multiple operations into a single
+//! batch, `mini_actor` provides a straightforward solution.
 //!
 //! ## Key Features
 //!
 //! - **Simple API**: A minimal surface area makes the library easy to learn and use.
 //! - **Flexible Execution**: Choose between awaiting a task's result or running it detached.
+//! - **Efficient Batching**: Group multiple tasks into a single execution batch to reduce overhead (e.g., for database inserts or logging).
 //! - **Built on Tokio**: Leverages the power and efficiency of the `tokio` ecosystem.
-//! - **Robust Error Handling**: Task panics are captured and returned as errors, not crashed.
+//! - **Robust Error Handling**: Individual task panics are captured and returned as errors, not crashed.
 //!
 //! ## Getting Started
 //!
-//! To begin, add `mini_actor` and `tokio` to your `Cargo.toml`:
+//! To begin, add `mini_actor`, `tokio`, and `dashmap` to your `Cargo.toml`:
 //!
 //! ```toml
 //! [dependencies]
 //! tokio = { version = "1", features = ["full"] }
-//! mini_actor = "0.1" # Replace with the desired version
-//! rayon = "1.10"
-//! tokio-rayon = "2.2"
+//! mini_actor = "0.2" // Replace with the desired version
+//! dashmap = "5.5"
 //! ```
 //!
-//! You'll need a `tokio::runtime::Runtime` to power the `Actor`. You can then define your tasks and use the actor to execute them.
+//! ## Quick Start
 //!
-//! ## Example Usage
+//! Here's a quick example demonstrating both individual and batch task execution.
 //!
 //! ```rust
-//! use std::time::Duration;
+//! use mini_actor::{Actor, Task, BatchTask};
 //! use tokio::runtime::Runtime;
-//! use tokio::time::sleep;
-//! use mini_actor::{Actor, Task};
 //! use std::sync::OnceLock;
+//! use tokio::time::{sleep, Duration};
 //!
-//! // 1. It's common practice to initialize the runtime as a static singleton.
-//! //    `std::sync::OnceLock` is a great way to achieve this.
-//! static RT: OnceLock<Runtime> = OnceLock::new();
+//! // -- Define an individual task --
+//! struct GreetTask(String);
 //!
-//! // 2. Define a task by implementing the `Task` trait.
-//! //    This task will take a string, sleep for a second, and return its length.
-//! struct MyTask {
-//!     input: String,
-//! }
-//!
-//! impl Task for MyTask {
-//!     type Output = usize;
-//!
+//! impl Task for GreetTask {
+//!     type Output = String;
 //!     async fn run(self) -> Self::Output {
-//!         println!("Task received input: '{}'", self.input);
-//!         sleep(Duration::from_secs(1)).await;
-//!         println!("Task finished processing.");
-//!         self.input.len()
+//!         format!("Hello, {}!", self.0)
 //!     }
 //! }
 //!
+//! // -- Define a batchable task --
+//! #[derive(Clone)]
+//! struct LogTask(String);
+//!
+//! impl BatchTask for LogTask {
+//!     async fn batch_run(list: Vec<Self>) {
+//!         println!("--- Batch Log ({} tasks) ---", list.len());
+//!         for task in list {
+//!             println!("Logged: {}", task.0);
+//!         }
+//!     }
+//! }
+//!
+//! // -- Setup and Execution --
+//! static RT: OnceLock<Runtime> = OnceLock::new();
+//!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 3. Initialize and start the runtime.
 //!     let rt = RT.get_or_init(|| Runtime::new().unwrap());
 //!     let actor = Actor::new(rt);
 //!
-//!     // 4. Execute the task and wait for the result.
-//!     //    The `?` operator propagates a potential task panic.
-//!     let task = MyTask { input: "hello".to_string() };
-//!     let result = rt.block_on(async {
-//!         actor.execute_waiting(task).await
+//!     rt.block_on(async {
+//!         // 1. Execute an individual task and wait for its result.
+//!         let greeting = actor.execute_waiting(GreetTask("World".into())).await?;
+//!         println!("{}", greeting); // Prints: "Hello, World!"
+//!
+//!         // 2. Execute several batch tasks without waiting.
+//!         actor.execute_batch_detached(LogTask("User session started".into()));
+//!         actor.execute_batch_detached(LogTask("Data loaded".into()));
+//!         
+//!         // Allow a moment for the detached batch to be processed.
+//!         sleep(Duration::from_millis(10)).await;
+//!
+//!         // The async block must return a Result because `?` was used.
+//!         Ok::<(), Box<dyn std::error::Error>>(())
 //!     })?;
-//!     println!("Result from awaited task: {}", result);
-//!
-//!     // Or, execute a task and detach it ("fire-and-forget").
-//!     let detached_task = MyTask { input: "world".to_string() };
-//!     let handle = actor.execute_detached(detached_task);
-//!     println!("Detached task is running in the background.");
-//!
-//!     // We can optionally wait for the detached handle later.
-//!     let result_from_handle = rt.block_on(async { handle.await })?;
-//!     println!("Result from detached task: {}", result_from_handle);
 //!
 //!     Ok(())
 //! }
 //! ```
-//!
-use tokio::{runtime::Runtime, task::{JoinError, JoinHandle}};
+
+use std::any::{Any, TypeId};
+use std::future::Future;
+
+use dashmap::DashMap;
+use tokio::{
+    runtime::Runtime,
+    sync::{
+        mpsc::{UnboundedSender, unbounded_channel},
+        oneshot,
+    },
+    task::{JoinError, JoinHandle},
+};
 
 /// A trait defining an asynchronously executable unit of work.
 ///
@@ -100,6 +116,51 @@ use tokio::{runtime::Runtime, task::{JoinError, JoinHandle}};
 ///     and has a lifetime that spans the entire program duration.
 /// *   `Output: Send + 'static`: Ensures the task's result can also be safely sent
 ///     across threads.
+///
+/// # Example
+///
+/// ```rust
+/// use mini_actor::{Actor, Task};
+/// use tokio::runtime::{Runtime, Builder};
+/// use tokio::time::{sleep, Duration};
+/// use std::sync::OnceLock;
+///
+/// // 1. Define the task struct.
+/// struct MySimpleTask {
+///     id: u32,
+/// }
+///
+/// // 2. Implement the `Task` trait for it.
+/// impl Task for MySimpleTask {
+///     type Output = String;
+///
+///     async fn run(self) -> Self::Output {
+///         sleep(Duration::from_millis(10)).await;
+///         format!("Task {} finished", self.id)
+///     }
+/// }
+///
+/// // 3. Execute it using an Actor.
+/// static RT: OnceLock<Runtime> = OnceLock::new();
+///
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let rt = RT.get_or_init(|| {
+///         Builder::new_current_thread()
+///             .enable_time() // Enable timers for `sleep`
+///             .build()
+///             .unwrap()
+///     });
+///     let actor = Actor::new(rt);
+///
+///     let result = rt.block_on(async {
+///         actor.execute_waiting(MySimpleTask { id: 1 }).await
+///     })?;
+///
+///     assert_eq!(result, "Task 1 finished");
+///     println!("{}", result);
+///     Ok(())
+/// }
+/// ```
 pub trait Task: Sized + Send + 'static {
     type Output: Send + 'static;
 
@@ -107,87 +168,93 @@ pub trait Task: Sized + Send + 'static {
     ///
     /// This method is an `async` function that returns a `Future`, which the `Actor`
     /// will poll to completion.
-    ///
-    /// ### Handling Blocking Operations
-    ///
-    /// It is crucial to **never** perform blocking operations directly within an async `run` method,
-    /// as this will stall the Tokio runtime thread, preventing other tasks from making progress.
-    /// Instead, offload blocking work to a thread pool appropriate for the task.
-    ///
-    /// #### Example: I/O-Bound Blocking Task
-    ///
-    /// For tasks that perform blocking I/O (e.g., interacting with a standard file or a blocking database driver),
-    /// use `tokio::task::spawn_blocking`. This moves the blocking operation to a dedicated Tokio thread pool,
-    /// allowing the async runtime to remain responsive.
-    ///
-    /// ```rust
-    /// # use mini_actor::Task;
-    /// use std::fs;
-    /// use std::io::Read;
-    ///
-    /// struct ReadFileTask {
-    ///     path: String,
-    /// }
-    ///
-    /// impl Task for ReadFileTask {
-    ///     type Output = Result<String, std::io::Error>;
-    ///
-    ///     async fn run(self) -> Self::Output {
-    ///         tokio::task::spawn_blocking(move || {
-    ///             let mut file = fs::File::open(self.path)?;
-    ///             let mut contents = String::new();
-    ///             file.read_to_string(&mut contents)?;
-    ///             Ok(contents)
-    ///         }).await.unwrap() // .await on the JoinHandle, leaving the inner Result
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// #### Example: CPU-Bound Parallel Task with `tokio-rayon`
-    ///
-    /// For CPU-intensive computations that can be parallelized (e.g., data processing, image resizing),
-    /// the `tokio-rayon` crate provides a bridge to run Rayon-powered tasks without blocking the Tokio runtime.
-    ///
-    /// First, add the dependencies to `Cargo.toml`:
-    /// ```toml
-    /// [dependencies]
-    /// rayon = "1.10"
-    /// tokio-rayon = "2.2"
-    /// ```
-    ///
-    /// Then, use `tokio_rayon::spawn` to run the parallel computation.
-    /// ```rust
-    /// # use mini_actor::Task;
-    /// // Make sure to add `rayon` and `tokio-rayon` to your Cargo.toml
-    /// use rayon::prelude::*;
-    ///
-    /// struct CpuIntensiveTask {
-    ///     data: Vec<u64>,
-    /// }
-    ///
-    /// impl Task for CpuIntensiveTask {
-    ///     type Output = u64;
-    ///
-    ///     async fn run(self) -> Self::Output {
-    ///         // `tokio_rayon::spawn` moves the computation to a Rayon thread pool
-    ///         // and returns a handle that we can .await.
-    ///         tokio_rayon::spawn(move || {
-    ///             self.data.into_par_iter()
-    ///                 .map(|n| n * n) // some parallel computation
-    ///                 .sum()
-    ///         }).await
-    ///     }
-    /// }
-    /// ```
-    fn run(self) -> impl std::future::Future<Output = Self::Output> + Send;
+    fn run(self) -> impl Future<Output = Self::Output> + Send;
 }
+
+/// Represents a task that can be processed in a batch.
+///
+/// This trait is designed for operations that can be optimized by grouping them together,
+/// such as database inserts, logging, or sending notifications. When multiple tasks of the
+/// same type are submitted to the `Actor` in quick succession, they are collected and
+/// executed in a single call to `batch_run`. Note that the `batch_run` function does not
+/// return a value and its signature must resolve to `()`.
+///
+/// # Type Constraints
+///
+/// *   `Sized + Send + 'static`: Ensures the task can be owned and moved between threads.
+///
+/// # Example
+///
+/// ```rust
+/// use mini_actor::{Actor, BatchTask};
+/// use tokio::runtime::{Runtime, Builder};
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::sync::{Arc, OnceLock};
+///
+/// // 1. Define a task that holds a reference to a shared counter.
+/// #[derive(Clone)]
+/// struct IncrementTask(Arc<AtomicUsize>);
+///
+/// // 2. Implement BatchTask to process multiple increments at once.
+/// impl BatchTask for IncrementTask {
+///     async fn batch_run(list: Vec<Self>) {
+///         if list.is_empty() { return; }
+///         // Access the Arc from the *first task* in the vector.
+///         let counter = list[0].0.clone();
+///         let total_increments = list.len();
+///         println!("Batch processing {} increments.", total_increments);
+///         counter.fetch_add(total_increments, Ordering::SeqCst);
+///     }
+/// }
+///
+/// // 3. Execute the batch task using an Actor.
+/// static RT: OnceLock<Runtime> = OnceLock::new();
+///
+/// fn main() {
+///     let rt = RT.get_or_init(|| Builder::new_current_thread().build().unwrap());
+///     let actor = Actor::new(rt);
+///     let counter = Arc::new(AtomicUsize::new(0));
+///
+///     rt.block_on(async {
+///         // We can execute and wait for a batch.
+///         actor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
+///         assert_eq!(counter.load(Ordering::SeqCst), 1);
+///
+///         // Or execute several in a fire-and-forget manner.
+///         actor.execute_batch_detached(IncrementTask(counter.clone()));
+///         actor.execute_batch_detached(IncrementTask(counter.clone()));
+///
+///         // Await the final task to ensure the previous detached ones are also processed.
+///         actor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
+///     });
+///     
+///     assert_eq!(counter.load(Ordering::SeqCst), 4);
+///     println!("Final counter value: {}", counter.load(Ordering::SeqCst));
+/// }
+/// ```
+pub trait BatchTask: Sized + Send + 'static {
+    /// The core logic for processing a batch of tasks.
+    ///
+    /// This method receives a `Vec<Self>` containing all tasks collected for the batch.
+    /// It should perform the work and return a `Future` that resolves when the batch
+    /// is complete.
+    fn batch_run(list: Vec<Self>) -> impl Future<Output = ()> + Send;
+}
+
+// Internal type for passing batch items through the actor's channels.
+// Contains the task and an optional oneshot sender for completion notification.
+type BatchItem<BT> = (BT, Option<oneshot::Sender<()>>);
 
 /// An `Actor` provides a simple interface for spawning tasks onto a Tokio `Runtime`.
 ///
 /// It holds a static reference to a `Runtime`, which acts as the task executor.
-/// This design encourages treating the runtime as a shared, long-lived resource.
+/// It also manages background workers for different types of batchable tasks, creating
+/// them on demand. This design encourages treating the runtime as a shared, long-lived resource.
+///
+/// For creation, see [`Actor::new`].
 pub struct Actor {
     rt: &'static Runtime,
+    batch_senders: DashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 impl Actor {
@@ -198,47 +265,34 @@ impl Actor {
     /// it must have a `'static` lifetime. This ensures the `Actor` can never outlive
     /// the runtime it depends on.
     ///
-    /// The two most common patterns to achieve this are shown below.
-    ///
     /// # Arguments
     ///
     /// * `rt`: A static reference to a `tokio::runtime::Runtime`.
     ///
-    /// # Example using `std::sync::OnceLock`
-    /// This is a very common and safe pattern for creating a global, static reference
-    /// to a resource that is initialized at runtime.
+    /// # Example
     ///
     /// ```rust
-    /// # use mini_actor::Actor;
+    /// use mini_actor::Actor;
     /// use tokio::runtime::Runtime;
     /// use std::sync::OnceLock;
     ///
+    /// // Use OnceLock to create a static runtime reference.
     /// static RT: OnceLock<Runtime> = OnceLock::new();
     ///
     /// fn main() {
     ///     let rt = RT.get_or_init(|| Runtime::new().unwrap());
     ///     let actor = Actor::new(rt);
-    ///     // ... actor can now be used
+    ///     // The actor is now ready to execute tasks.
     /// }
     /// ```
-    ///
-    /// # Example using `Box::leak`
-    /// This pattern creates a `'static` reference by intentionally leaking memory, which is
-    /// an acceptable trade-off for singletons that must exist for the program's entire lifetime.
-    ///
-    /// ```rust
-    /// # use mini_actor::Actor;
-    /// use tokio::runtime::Runtime;
-    ///
-    /// let rt = Box::leak(Box::new(Runtime::new().unwrap()));
-    /// let actor = Actor::new(rt);
-    /// // ... actor can now be used
-    /// ```
     pub fn new(rt: &'static Runtime) -> Self {
-        Actor { rt }
+        Actor {
+            rt,
+            batch_senders: DashMap::new(),
+        }
     }
 
-    /// Spawns a task and asynchronously waits for its result.
+    /// Spawns an individual task and asynchronously waits for its result.
     ///
     /// This method submits the task to the actor's runtime and suspends the current
     /// async context until the task has finished.
@@ -259,18 +313,25 @@ impl Actor {
     /// # use mini_actor::{Actor, Task};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
+    /// #
     /// # static RT: OnceLock<Runtime> = OnceLock::new();
-    /// # struct MyTask;
-    /// # impl Task for MyTask { type Output = u32; async fn run(self) -> Self::Output { 42 } }
-    /// # fn main() {
-    /// #   let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// #   let actor = Actor::new(rt);
-    /// #   rt.block_on(async {
-    /// // .await returns a Result, which can be handled or propagated with `?`
-    /// let result = actor.execute_waiting(MyTask).await;
-    /// assert!(result.is_ok());
-    /// assert_eq!(result.unwrap(), 42);
-    /// #   });
+    /// #
+    /// struct MyTask;
+    /// impl Task for MyTask {
+    ///     type Output = u32;
+    ///     async fn run(self) -> Self::Output { 42 }
+    /// }
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
+    /// let actor = Actor::new(rt);
+    ///
+    /// rt.block_on(async {
+    ///     let result = actor.execute_waiting(MyTask).await?;
+    ///     assert_eq!(result, 42);
+    ///     Ok::<(), Box<dyn std::error::Error>>(())
+    /// })?;
+    /// # Ok(())
     /// # }
     /// ```
     pub async fn execute_waiting<T: Task>(&self, task: T) -> Result<T::Output, JoinError> {
@@ -278,7 +339,7 @@ impl Actor {
         handle.await
     }
 
-    /// Spawns a task and immediately returns a `JoinHandle` without awaiting it.
+    /// Spawns an individual task and immediately returns a `JoinHandle` without awaiting it.
     ///
     /// This is useful for "fire-and-forget" style execution, where the task runs
     /// in the background. The returned `JoinHandle` can still be used to await the task's
@@ -287,9 +348,6 @@ impl Actor {
     /// # Arguments
     ///
     /// * `task`: An instance of a type that implements the `Task` trait.
-    ///
-    /// `Ok(T::Output)`: The successful output of the task.
-    /// `Err(JoinError)`: An error indicating that the task panicked during execution.
     ///
     /// # Returns
     ///
@@ -302,23 +360,240 @@ impl Actor {
     /// # use mini_actor::{Actor, Task};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
+    /// #
     /// # static RT: OnceLock<Runtime> = OnceLock::new();
-    /// # struct MyTask;
-    /// # impl Task for MyTask { type Output = u32; async fn run(self) -> Self::Output { 42 } }
-    /// # fn main() {
-    /// #   let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// #   let actor = Actor::new(rt);
-    /// #   rt.block_on(async {
-    /// let handle = actor.execute_detached(MyTask);
-    /// // You can perform other work here while the task runs in the background.
+    /// #
+    /// struct BackgroundTask;
+    /// impl Task for BackgroundTask {
+    ///     type Output = String;
+    ///     async fn run(self) -> Self::Output { "done".to_string() }
+    /// }
+    /// #
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
+    /// let actor = Actor::new(rt);
+    /// #
+    /// rt.block_on(async {
+    ///     // Spawn the task but don't wait for it yet.
+    ///     let handle = actor.execute_detached(BackgroundTask);
     ///
-    /// // Later, you can await the handle to get the result.
-    /// let result = handle.await.unwrap();
-    /// assert_eq!(result, 42);
-    /// #   });
+    ///     // We can do other work here...
+    ///     println!("Task is running in the background.");
+    ///
+    ///     // Later, await the handle to get the result.
+    ///     let result = handle.await?;
+    ///     assert_eq!(result, "done");
+    ///     Ok::<(), Box<dyn std::error::Error>>(())
+    /// })?;
+    /// # Ok(())
     /// # }
     /// ```
     pub fn execute_detached<T: Task>(&self, task: T) -> JoinHandle<T::Output> {
         self.rt.spawn(task.run())
+    }
+
+    /// Executes a batch task asynchronously without waiting for its completion.
+    ///
+    /// This method submits a task to its corresponding batch processor. If a processor for this
+    /// task type does not exist, one is spawned. The task will be collected with other
+    /// pending tasks of the same type and executed in a single batch.
+    ///
+    /// This is a "fire-and-forget" operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_task`: An instance of a type that implements `BatchTask`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use mini_actor::{Actor, BatchTask};
+    /// # use tokio::runtime::Runtime;
+    /// # use std::sync::OnceLock;
+    /// # use tokio::time::{sleep, Duration};
+    /// #
+    /// # static RT: OnceLock<Runtime> = OnceLock::new();
+    /// #
+    /// #[derive(Clone)]
+    /// struct LogMessage(String);
+    /// impl BatchTask for LogMessage {
+    ///     async fn batch_run(list: Vec<Self>) {
+    ///         // In a real app, this might write to a file or database.
+    ///         println!("-- Logging batch of {} messages --", list.len());
+    ///         for msg in list {
+    ///             println!("{}", msg.0);
+    ///         }
+    ///     }
+    /// }
+    /// #
+    /// # fn main() {
+    /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
+    /// let actor = Actor::new(rt);
+    ///
+    /// rt.block_on(async {
+    ///     // Fire-and-forget these logging tasks.
+    ///     actor.execute_batch_detached(LogMessage("User logged in".to_string()));
+    ///     actor.execute_batch_detached(LogMessage("Data processed".to_string()));
+    ///
+    ///     // Give the batch processor a moment to run.
+    ///     sleep(Duration::from_millis(50)).await;
+    /// });
+    /// # }
+    /// ```
+    pub fn execute_batch_detached<BT: BatchTask + Clone>(&self, batch_task: BT) {
+        let key = TypeId::of::<BT>();
+        if let Some(sender_any) = self.batch_senders.get(&key) {
+            let sender = sender_any
+                .downcast_ref::<UnboundedSender<BatchItem<BT>>>()
+                .expect("Type mismatch in batch_senders");
+            // For detached mode, we pass `None` as the signal sender.
+            sender
+                .send((batch_task, None))
+                .expect("Failed to send batch task");
+        } else {
+            // If a batch processor for this task type doesn't exist, create a new one.
+            let (tx, mut rx) = unbounded_channel::<BatchItem<BT>>();
+
+            let _handle: JoinHandle<()> = self.rt.spawn(async move {
+                loop {
+                    // Wait for the first task to arrive.
+                    if let Some((first_task, first_sender)) = rx.recv().await {
+                        let mut tasks = vec![first_task];
+                        let mut senders = vec![first_sender];
+
+                        // Try to drain as many tasks as possible from the channel to form a batch.
+                        while let Ok((task, sender)) = rx.try_recv() {
+                            tasks.push(task);
+                            senders.push(sender);
+                        }
+
+                        // Execute the batch processing.
+                        BT::batch_run(tasks).await;
+
+                        // After batch processing is complete, notify all waiting callers.
+                        for sender_opt in senders.into_iter() {
+                            if let Some(sender) = sender_opt {
+                                // This will return an error if the receiver has been dropped, but we ignore it.
+                                let _ = sender.send(());
+                            }
+                        }
+                    } else {
+                        // If the channel is closed, exit the loop.
+                        break;
+                    }
+                }
+            });
+            // Store the new sender in the DashMap.
+            self.batch_senders.insert(key, Box::new(tx.clone()));
+            // Send the first task.
+            tx.send((batch_task, None))
+                .expect("Failed to send initial batch task");
+        }
+    }
+
+    /// Executes a batch task and waits for its containing batch to complete.
+    ///
+    /// This method submits a task to its batch processor and waits for a completion signal.
+    /// The signal is sent after the entire batch (which includes this task) has finished processing.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_task`: An instance of a type that implements `BatchTask`.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` which is `Ok(())` on successful completion of the batch. It returns
+    /// `Err(oneshot::error::RecvError)` if the batch processor panics or is terminated
+    /// before sending a completion signal.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use mini_actor::{Actor, BatchTask};
+    /// # use tokio::runtime::Runtime;
+    /// # use std::sync::OnceLock;
+    /// #
+    /// # static RT: OnceLock<Runtime> = OnceLock::new();
+    /// #
+    /// #[derive(Clone)]
+    /// struct DatabaseInsert(u32);
+    /// impl BatchTask for DatabaseInsert {
+    ///     async fn batch_run(list: Vec<Self>) {
+    ///         let ids: Vec<u32> = list.into_iter().map(|item| item.0).collect();
+    ///         println!("BATCH INSERT: Simulating inserting IDs: {:?}", ids);
+    ///         // In a real app, you'd perform the batched database query here.
+    ///     }
+    /// }
+    /// #
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
+    /// let actor = Actor::new(rt);
+    ///
+    /// rt.block_on(async {
+    ///     // Detach a few tasks first.
+    ///     actor.execute_batch_detached(DatabaseInsert(1));
+    ///     actor.execute_batch_detached(DatabaseInsert(2));
+    ///     
+    ///     // Now, execute a task and wait for its batch to complete.
+    ///     // This task will be batched with the two above.
+    ///     let result = actor.execute_batch_waiting(DatabaseInsert(3)).await;
+    ///     
+    ///     assert!(result.is_ok());
+    ///     println!("Batch confirmed as complete.");
+    /// });
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_batch_waiting<BT: BatchTask + Clone>(
+        &self,
+        batch_task: BT,
+    ) -> Result<(), oneshot::error::RecvError> {
+        let key = TypeId::of::<BT>();
+        // Create a oneshot channel to receive the completion signal.
+        let (tx_oneshot, rx_oneshot) = oneshot::channel::<()>();
+
+        if let Some(sender_any) = self.batch_senders.get(&key) {
+            let sender = sender_any
+                .downcast_ref::<UnboundedSender<BatchItem<BT>>>()
+                .expect("Type mismatch in batch_senders");
+            // Send the task along with the signal sender.
+            sender
+                .send((batch_task, Some(tx_oneshot)))
+                .expect("Failed to send batch task");
+        } else {
+            // If a batch processor for this task type doesn't exist, create a new one.
+            let (tx, mut rx) = unbounded_channel::<BatchItem<BT>>();
+
+            let _handle: JoinHandle<()> = self.rt.spawn(async move {
+                loop {
+                    if let Some((first_task, first_sender)) = rx.recv().await {
+                        let mut tasks = vec![first_task];
+                        let mut senders = vec![first_sender];
+
+                        while let Ok((task, sender)) = rx.try_recv() {
+                            tasks.push(task);
+                            senders.push(sender);
+                        }
+
+                        BT::batch_run(tasks).await;
+
+                        for sender_opt in senders.into_iter() {
+                            if let Some(sender) = sender_opt {
+                                let _ = sender.send(());
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+            // Store the new sender.
+            self.batch_senders.insert(key, Box::new(tx.clone()));
+            // Send the first task.
+            tx.send((batch_task, Some(tx_oneshot)))
+                .expect("Failed to send initial batch task");
+        }
+        // Wait for the completion signal.
+        rx_oneshot.await
     }
 }
