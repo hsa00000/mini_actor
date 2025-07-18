@@ -1,18 +1,19 @@
-# mini_actor
+# mini_executor
 
-The smallest, simplest Rust actor model built on Tokio runtime.
+The smallest, simplest Rust task executor built on Tokio runtime.
 
 ## Features
 
-- Minimal trait-based design (`Task`)
-- Simple `Actor` that runs tasks on a Tokio runtime
-- Two modes: `execute_waiting()` and `execute_detached()`
+- Minimal trait-based design (`Task` and `BatchTask`)
+- Simple `TaskExecutor` that runs tasks on a Tokio runtime
+- Individual task execution: `execute_waiting()` and `execute_detached()`
+- Batch processing: `execute_batch_waiting()` and `execute_batch_detached()`
 
 ## Example
 
 ```rust
 use tokio::runtime::Runtime;
-use mini_actor::{Actor, Task};
+use mini_executor::{TaskExecutor, Task};
 
 struct MyTask;
 impl Task for MyTask {
@@ -23,5 +24,5 @@ impl Task for MyTask {
 }
 
 let rt = Box::leak(Box::new(Runtime::new().unwrap()));
-let actor = Actor::new(rt);
-let result = actor.execute_waiting(MyTask).await;
+let executor = TaskExecutor::new(rt);
+let result = executor.execute_waiting(MyTask).await;

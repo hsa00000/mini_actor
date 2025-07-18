@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-//! # mini_actor
+//! # mini_executor
 //!
-//! A minimalist, lightweight, and intuitive actor-like library for Rust, designed to work seamlessly with the Tokio runtime.
+//! A minimalist, lightweight, and intuitive task execution library for Rust, designed to work seamlessly with the Tokio runtime.
 //!
 //! This crate offers a simple and ergonomic API to spawn asynchronous tasks, manage their lifecycle, and retrieve their results.
 //! It supports both individual task execution and efficient batch processing. Whether you need to wait for a task to complete
 //! for synchronous-style control flow, execute it in a "fire-and-forget" manner, or group multiple operations into a single
-//! batch, `mini_actor` provides a straightforward solution.
+//! batch, `mini_executor` provides a straightforward solution.
 //!
 //! ## Key Features
 //!
@@ -19,12 +19,12 @@
 //!
 //! ## Getting Started
 //!
-//! To begin, add `mini_actor`, `tokio`, and `dashmap` to your `Cargo.toml`:
+//! To begin, add `mini_executor`, `tokio`, and `dashmap` to your `Cargo.toml`:
 //!
 //! ```toml
 //! [dependencies]
 //! tokio = { version = "1", features = ["full"] }
-//! mini_actor = "0.2" // Replace with the desired version
+//! mini_executor = "2.0" // Replace with the desired version
 //! dashmap = "5.5"
 //! ```
 //!
@@ -33,7 +33,7 @@
 //! Here's a quick example demonstrating both individual and batch task execution.
 //!
 //! ```rust
-//! use mini_actor::{Actor, Task, BatchTask};
+//! use mini_executor::{TaskExecutor, Task, BatchTask};
 //! use tokio::runtime::Runtime;
 //! use std::sync::OnceLock;
 //! use tokio::time::{sleep, Duration};
@@ -66,16 +66,16 @@
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let rt = RT.get_or_init(|| Runtime::new().unwrap());
-//!     let actor = Actor::new(rt);
+//!     let executor = TaskExecutor::new(rt);
 //!
 //!     rt.block_on(async {
 //!         // 1. Execute an individual task and wait for its result.
-//!         let greeting = actor.execute_waiting(GreetTask("World".into())).await?;
+//!         let greeting = executor.execute_waiting(GreetTask("World".into())).await?;
 //!         println!("{}", greeting); // Prints: "Hello, World!"
 //!
 //!         // 2. Execute several batch tasks without waiting.
-//!         actor.execute_batch_detached(LogTask("User session started".into()));
-//!         actor.execute_batch_detached(LogTask("Data loaded".into()));
+//!         executor.execute_batch_detached(LogTask("User session started".into()));
+//!         executor.execute_batch_detached(LogTask("Data loaded".into()));
 //!         
 //!         // Allow a moment for the detached batch to be processed.
 //!         sleep(Duration::from_millis(10)).await;
@@ -103,7 +103,7 @@ use tokio::{
 
 /// A trait defining an asynchronously executable unit of work.
 ///
-/// Implement this trait for any struct that represents a task for the `Actor` to run.
+/// Implement this trait for any struct that represents a task for the `TaskExecutor` to run.
 /// The `run` method contains the core logic of the task and is executed asynchronously.
 ///
 /// # Associated Types
@@ -120,7 +120,7 @@ use tokio::{
 /// # Example
 ///
 /// ```rust
-/// use mini_actor::{Actor, Task};
+/// use mini_executor::{TaskExecutor, Task};
 /// use tokio::runtime::{Runtime, Builder};
 /// use tokio::time::{sleep, Duration};
 /// use std::sync::OnceLock;
@@ -140,7 +140,7 @@ use tokio::{
 ///     }
 /// }
 ///
-/// // 3. Execute it using an Actor.
+/// // 3. Execute it using a TaskExecutor.
 /// static RT: OnceLock<Runtime> = OnceLock::new();
 ///
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,10 +150,10 @@ use tokio::{
 ///             .build()
 ///             .unwrap()
 ///     });
-///     let actor = Actor::new(rt);
+///     let executor = TaskExecutor::new(rt);
 ///
 ///     let result = rt.block_on(async {
-///         actor.execute_waiting(MySimpleTask { id: 1 }).await
+///         executor.execute_waiting(MySimpleTask { id: 1 }).await
 ///     })?;
 ///
 ///     assert_eq!(result, "Task 1 finished");
@@ -166,7 +166,7 @@ pub trait Task: Sized + Send + 'static {
 
     /// The core logic of the task.
     ///
-    /// This method is an `async` function that returns a `Future`, which the `Actor`
+    /// This method is an `async` function that returns a `Future`, which the `TaskExecutor`
     /// will poll to completion.
     fn run(self) -> impl Future<Output = Self::Output> + Send;
 }
@@ -175,7 +175,7 @@ pub trait Task: Sized + Send + 'static {
 ///
 /// This trait is designed for operations that can be optimized by grouping them together,
 /// such as database inserts, logging, or sending notifications. When multiple tasks of the
-/// same type are submitted to the `Actor` in quick succession, they are collected and
+/// same type are submitted to the `TaskExecutor` in quick succession, they are collected and
 /// executed in a single call to `batch_run`. Note that the `batch_run` function does not
 /// return a value and its signature must resolve to `()`.
 ///
@@ -186,7 +186,7 @@ pub trait Task: Sized + Send + 'static {
 /// # Example
 ///
 /// ```rust
-/// use mini_actor::{Actor, BatchTask};
+/// use mini_executor::{TaskExecutor, BatchTask};
 /// use tokio::runtime::{Runtime, Builder};
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use std::sync::{Arc, OnceLock};
@@ -207,25 +207,25 @@ pub trait Task: Sized + Send + 'static {
 ///     }
 /// }
 ///
-/// // 3. Execute the batch task using an Actor.
+/// // 3. Execute the batch task using a TaskExecutor.
 /// static RT: OnceLock<Runtime> = OnceLock::new();
 ///
 /// fn main() {
 ///     let rt = RT.get_or_init(|| Builder::new_current_thread().build().unwrap());
-///     let actor = Actor::new(rt);
+///     let executor = TaskExecutor::new(rt);
 ///     let counter = Arc::new(AtomicUsize::new(0));
 ///
 ///     rt.block_on(async {
 ///         // We can execute and wait for a batch.
-///         actor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
+///         executor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
 ///         assert_eq!(counter.load(Ordering::SeqCst), 1);
 ///
 ///         // Or execute several in a fire-and-forget manner.
-///         actor.execute_batch_detached(IncrementTask(counter.clone()));
-///         actor.execute_batch_detached(IncrementTask(counter.clone()));
+///         executor.execute_batch_detached(IncrementTask(counter.clone()));
+///         executor.execute_batch_detached(IncrementTask(counter.clone()));
 ///
 ///         // Await the final task to ensure the previous detached ones are also processed.
-///         actor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
+///         executor.execute_batch_waiting(IncrementTask(counter.clone())).await.unwrap();
 ///     });
 ///     
 ///     assert_eq!(counter.load(Ordering::SeqCst), 4);
@@ -241,28 +241,28 @@ pub trait BatchTask: Sized + Send + 'static {
     fn batch_run(list: Vec<Self>) -> impl Future<Output = ()> + Send;
 }
 
-// Internal type for passing batch items through the actor's channels.
+// Internal type for passing batch items through the task executor's channels.
 // Contains the task and an optional oneshot sender for completion notification.
 type BatchItem<BT> = (BT, Option<oneshot::Sender<()>>);
 
-/// An `Actor` provides a simple interface for spawning tasks onto a Tokio `Runtime`.
+/// A `TaskExecutor` provides a simple interface for spawning tasks onto a Tokio `Runtime`.
 ///
 /// It holds a static reference to a `Runtime`, which acts as the task executor.
 /// It also manages background workers for different types of batchable tasks, creating
 /// them on demand. This design encourages treating the runtime as a shared, long-lived resource.
 ///
-/// For creation, see [`Actor::new`].
-pub struct Actor {
+/// For creation, see [`TaskExecutor::new`].
+pub struct TaskExecutor {
     rt: &'static Runtime,
     batch_senders: DashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
-impl Actor {
-    /// Creates a new `Actor` instance bound to a statically-lived Tokio runtime.
+impl TaskExecutor {
+    /// Creates a new `TaskExecutor` instance bound to a statically-lived Tokio runtime.
     ///
     /// An application will typically create a single `Runtime` instance that lives for the
-    /// duration of the program. To pass a reference of this runtime to the `Actor`,
-    /// it must have a `'static` lifetime. This ensures the `Actor` can never outlive
+    /// duration of the program. To pass a reference of this runtime to the `TaskExecutor`,
+    /// it must have a `'static` lifetime. This ensures the `TaskExecutor` can never outlive
     /// the runtime it depends on.
     ///
     /// # Arguments
@@ -272,7 +272,7 @@ impl Actor {
     /// # Example
     ///
     /// ```rust
-    /// use mini_actor::Actor;
+    /// use mini_executor::TaskExecutor;
     /// use tokio::runtime::Runtime;
     /// use std::sync::OnceLock;
     ///
@@ -281,12 +281,12 @@ impl Actor {
     ///
     /// fn main() {
     ///     let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    ///     let actor = Actor::new(rt);
-    ///     // The actor is now ready to execute tasks.
+    ///     let executor = TaskExecutor::new(rt);
+    ///     // The task executor is now ready to execute tasks.
     /// }
     /// ```
     pub fn new(rt: &'static Runtime) -> Self {
-        Actor {
+        TaskExecutor {
             rt,
             batch_senders: DashMap::new(),
         }
@@ -294,7 +294,7 @@ impl Actor {
 
     /// Spawns an individual task and asynchronously waits for its result.
     ///
-    /// This method submits the task to the actor's runtime and suspends the current
+    /// This method submits the task to the executor's runtime and suspends the current
     /// async context until the task has finished.
     ///
     /// # Arguments
@@ -310,7 +310,7 @@ impl Actor {
     /// # Example
     ///
     /// ```rust
-    /// # use mini_actor::{Actor, Task};
+    /// # use mini_executor::{TaskExecutor, Task};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
     /// #
@@ -324,10 +324,10 @@ impl Actor {
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// let actor = Actor::new(rt);
+    /// let executor = TaskExecutor::new(rt);
     ///
     /// rt.block_on(async {
-    ///     let result = actor.execute_waiting(MyTask).await?;
+    ///     let result = executor.execute_waiting(MyTask).await?;
     ///     assert_eq!(result, 42);
     ///     Ok::<(), Box<dyn std::error::Error>>(())
     /// })?;
@@ -357,7 +357,7 @@ impl Actor {
     /// # Example
     ///
     /// ```rust
-    /// # use mini_actor::{Actor, Task};
+    /// # use mini_executor::{TaskExecutor, Task};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
     /// #
@@ -371,11 +371,11 @@ impl Actor {
     /// #
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// let actor = Actor::new(rt);
+    /// let executor = TaskExecutor::new(rt);
     /// #
     /// rt.block_on(async {
     ///     // Spawn the task but don't wait for it yet.
-    ///     let handle = actor.execute_detached(BackgroundTask);
+    ///     let handle = executor.execute_detached(BackgroundTask);
     ///
     ///     // We can do other work here...
     ///     println!("Task is running in the background.");
@@ -407,7 +407,7 @@ impl Actor {
     /// # Example
     ///
     /// ```rust
-    /// # use mini_actor::{Actor, BatchTask};
+    /// # use mini_executor::{TaskExecutor, BatchTask};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
     /// # use tokio::time::{sleep, Duration};
@@ -428,12 +428,12 @@ impl Actor {
     /// #
     /// # fn main() {
     /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// let actor = Actor::new(rt);
+    /// let executor = TaskExecutor::new(rt);
     ///
     /// rt.block_on(async {
     ///     // Fire-and-forget these logging tasks.
-    ///     actor.execute_batch_detached(LogMessage("User logged in".to_string()));
-    ///     actor.execute_batch_detached(LogMessage("Data processed".to_string()));
+    ///     executor.execute_batch_detached(LogMessage("User logged in".to_string()));
+    ///     executor.execute_batch_detached(LogMessage("Data processed".to_string()));
     ///
     ///     // Give the batch processor a moment to run.
     ///     sleep(Duration::from_millis(50)).await;
@@ -509,7 +509,7 @@ impl Actor {
     /// # Example
     ///
     /// ```rust
-    /// # use mini_actor::{Actor, BatchTask};
+    /// # use mini_executor::{TaskExecutor, BatchTask};
     /// # use tokio::runtime::Runtime;
     /// # use std::sync::OnceLock;
     /// #
@@ -527,16 +527,16 @@ impl Actor {
     /// #
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let rt = RT.get_or_init(|| Runtime::new().unwrap());
-    /// let actor = Actor::new(rt);
+    /// let executor = TaskExecutor::new(rt);
     ///
     /// rt.block_on(async {
     ///     // Detach a few tasks first.
-    ///     actor.execute_batch_detached(DatabaseInsert(1));
-    ///     actor.execute_batch_detached(DatabaseInsert(2));
+    ///     executor.execute_batch_detached(DatabaseInsert(1));
+    ///     executor.execute_batch_detached(DatabaseInsert(2));
     ///     
     ///     // Now, execute a task and wait for its batch to complete.
     ///     // This task will be batched with the two above.
-    ///     let result = actor.execute_batch_waiting(DatabaseInsert(3)).await;
+    ///     let result = executor.execute_batch_waiting(DatabaseInsert(3)).await;
     ///     
     ///     assert!(result.is_ok());
     ///     println!("Batch confirmed as complete.");
@@ -735,28 +735,28 @@ mod tests {
         }
     }
 
-    // Test Actor::new
+    // Test TaskExecutor::new
     #[test]
-    fn test_actor_new() {
+    fn test_task_executor_new() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
-        // Verify actor is created successfully
-        assert_eq!(actor.batch_senders.len(), 0);
+        // Verify task executor is created successfully
+        assert_eq!(executor.batch_senders.len(), 0);
     }
 
     // Test execute_waiting with simple task
     #[test]
     fn test_execute_waiting_simple() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let task = SimpleTask {
                 id: 1,
                 value: "test".to_string(),
             };
-            actor.execute_waiting(task).await
+            executor.execute_waiting(task).await
         });
 
         assert!(result.is_ok());
@@ -767,14 +767,14 @@ mod tests {
     #[test]
     fn test_execute_waiting_delayed() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let task = DelayedTask {
                 id: 42,
                 delay_ms: 50,
             };
-            actor.execute_waiting(task).await
+            executor.execute_waiting(task).await
         });
 
         assert!(result.is_ok());
@@ -785,11 +785,11 @@ mod tests {
     #[test]
     fn test_execute_waiting_panic() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let task = PanicTask;
-            actor.execute_waiting(task).await
+            executor.execute_waiting(task).await
         });
 
         assert!(result.is_err());
@@ -800,14 +800,14 @@ mod tests {
     #[test]
     fn test_execute_detached() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let task = SimpleTask {
                 id: 2,
                 value: "detached".to_string(),
             };
-            let handle = actor.execute_detached(task);
+            let handle = executor.execute_detached(task);
             handle.await
         });
 
@@ -819,11 +819,11 @@ mod tests {
     #[test]
     fn test_execute_detached_panic() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let task = PanicTask;
-            let handle = actor.execute_detached(task);
+            let handle = executor.execute_detached(task);
             handle.await
         });
 
@@ -835,20 +835,20 @@ mod tests {
     #[test]
     fn test_execute_batch_detached() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
             // Send multiple batch tasks
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 1,
             });
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 2,
             });
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 3,
             });
@@ -864,22 +864,22 @@ mod tests {
     #[test]
     fn test_execute_batch_waiting() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         let result = rt.block_on(async {
             // Send some detached tasks first
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 5,
             });
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 10,
             });
 
             // Send a waiting task - this should batch with the above
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 15,
@@ -895,22 +895,22 @@ mod tests {
     #[test]
     fn test_batch_processing_with_storage() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let log_storage = Arc::new(Mutex::new(Vec::new()));
 
         rt.block_on(async {
             // Send multiple log tasks
-            actor.execute_batch_detached(LogTask {
+            executor.execute_batch_detached(LogTask {
                 message: "First log".to_string(),
                 log_storage: log_storage.clone(),
             });
-            actor.execute_batch_detached(LogTask {
+            executor.execute_batch_detached(LogTask {
                 message: "Second log".to_string(),
                 log_storage: log_storage.clone(),
             });
 
             // Wait for a batch to complete
-            actor
+            executor
                 .execute_batch_waiting(LogTask {
                     message: "Third log".to_string(),
                     log_storage: log_storage.clone(),
@@ -930,13 +930,13 @@ mod tests {
     #[test]
     fn test_delayed_batch_processing() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let results = Arc::new(Mutex::new(Vec::new()));
 
         let result = rt.block_on(async {
             timeout(
                 Duration::from_millis(500),
-                actor.execute_batch_waiting(DelayedBatchTask {
+                executor.execute_batch_waiting(DelayedBatchTask {
                     id: 1,
                     delay_ms: 100,
                     results: results.clone(),
@@ -957,30 +957,30 @@ mod tests {
     #[test]
     fn test_multiple_batch_types() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
         let log_storage = Arc::new(Mutex::new(Vec::new()));
 
         rt.block_on(async {
             // Submit different types of batch tasks
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 100,
             });
-            actor.execute_batch_detached(LogTask {
+            executor.execute_batch_detached(LogTask {
                 message: "Mixed batch test".to_string(),
                 log_storage: log_storage.clone(),
             });
 
             // Wait for both to complete
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 200,
                 })
                 .await
                 .unwrap();
-            actor
+            executor
                 .execute_batch_waiting(LogTask {
                     message: "Mixed batch test 2".to_string(),
                     log_storage: log_storage.clone(),
@@ -998,14 +998,14 @@ mod tests {
     #[test]
     fn test_concurrent_execution() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             let mut handles = Vec::new();
 
             // Start multiple tasks concurrently
             for i in 0..10 {
-                let handle = actor.execute_detached(DelayedTask {
+                let handle = executor.execute_detached(DelayedTask {
                     id: i,
                     delay_ms: 20,
                 });
@@ -1030,12 +1030,12 @@ mod tests {
     #[test]
     fn test_batch_error_handling() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
 
         let result = rt.block_on(async {
             timeout(
                 Duration::from_millis(500),
-                actor.execute_batch_waiting(PanicBatchTask),
+                executor.execute_batch_waiting(PanicBatchTask),
             )
             .await
         });
@@ -1049,12 +1049,12 @@ mod tests {
     #[test]
     fn test_batch_processor_reuse() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
             // First batch
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 1,
@@ -1063,7 +1063,7 @@ mod tests {
                 .unwrap();
 
             // Second batch - should reuse the same processor
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 2,
@@ -1074,14 +1074,14 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 3);
         // Verify that only one batch processor was created
-        assert_eq!(actor.batch_senders.len(), 1);
+        assert_eq!(executor.batch_senders.len(), 1);
     }
 
     // Test empty batch handling
     #[test]
     fn test_empty_batch_handling() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         // Create a batch task that handles empty lists
@@ -1100,7 +1100,7 @@ mod tests {
         }
 
         let result = rt.block_on(async {
-            actor
+            executor
                 .execute_batch_waiting(EmptyBatchTask {
                     counter: counter.clone(),
                 })
@@ -1115,20 +1115,20 @@ mod tests {
     #[test]
     fn test_high_volume_batch_processing() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
             // Submit many batch tasks quickly
             for i in 0..100 {
-                actor.execute_batch_detached(CounterTask {
+                executor.execute_batch_detached(CounterTask {
                     counter: counter.clone(),
                     increment: i,
                 });
             }
 
             // Wait for processing to complete
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 0,
@@ -1145,17 +1145,17 @@ mod tests {
     #[test]
     fn test_mixed_execution_patterns() {
         let rt = get_test_runtime();
-        let actor = Actor::new(rt);
+        let executor = TaskExecutor::new(rt);
         let counter = Arc::new(AtomicUsize::new(0));
 
         rt.block_on(async {
             // Mix of individual and batch tasks
-            let individual_handle = actor.execute_detached(DelayedTask {
+            let individual_handle = executor.execute_detached(DelayedTask {
                 id: 999,
                 delay_ms: 50,
             });
 
-            actor.execute_batch_detached(CounterTask {
+            executor.execute_batch_detached(CounterTask {
                 counter: counter.clone(),
                 increment: 10,
             });
@@ -1163,7 +1163,7 @@ mod tests {
             let individual_result = individual_handle.await.unwrap();
             assert_eq!(individual_result, 999);
 
-            actor
+            executor
                 .execute_batch_waiting(CounterTask {
                     counter: counter.clone(),
                     increment: 20,
@@ -1171,7 +1171,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let batch_result = actor
+            let batch_result = executor
                 .execute_waiting(SimpleTask {
                     id: 777,
                     value: "mixed".to_string(),
