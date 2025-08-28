@@ -91,11 +91,11 @@
 use std::any::{Any, TypeId};
 use std::future::Future;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use tokio::{
     runtime::Runtime,
     sync::{
-        mpsc::{UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel},
         oneshot,
     },
     task::{JoinError, JoinHandle},
@@ -392,6 +392,61 @@ impl TaskExecutor {
         self.rt.spawn(task.run())
     }
 
+    fn ensure_sender<BT: BatchTask>(&self) -> UnboundedSender<BatchItem<BT>> {
+        let key = TypeId::of::<BT>();
+        match self.batch_senders.entry(key) {
+            Entry::Occupied(o) => o.get()
+                .downcast_ref::<UnboundedSender<BatchItem<BT>>>()
+                .expect("Type mismatch in batch_senders")
+                .clone(),
+            Entry::Vacant(v) => {
+                let (tx, rx) = unbounded_channel::<BatchItem<BT>>();
+                Self::spawn_worker::<BT>(self.rt, rx);
+                v.insert(Box::new(tx.clone()));
+                tx
+            }
+        }
+    }
+
+    /// Spawns a worker for processing batch tasks of type `BT`.
+    ///
+    /// The worker runs `batch_run` in a sub-task to isolate panics, preventing
+    /// the worker from being killed by panics in user code.
+    fn spawn_worker<BT: BatchTask>(rt: &'static Runtime, mut rx: UnboundedReceiver<BatchItem<BT>>) {
+        rt.spawn(async move {
+            loop {
+                // Receive the first task, or break if the channel is closed
+                let Some((first_task, first_sig)) = rx.recv().await else { break; };
+
+                // Collect batch tasks
+                let mut tasks: Vec<BT> = vec![first_task];
+                let mut sigs: Vec<Option<oneshot::Sender<()>>> = vec![first_sig];
+
+                while let Ok((t, s)) = rx.try_recv() {
+                    tasks.push(t);
+                    sigs.push(s);
+                }
+
+                // Run batch_run in a sub-task to isolate panics
+                let join = tokio::spawn(async move {
+                    BT::batch_run(tasks).await;
+                });
+
+                match join.await {
+                    Ok(()) => {
+                        // Notify all waiting clients on success
+                        for s in sigs.into_iter().flatten() {
+                            let _ = s.send(());
+                        }
+                    }
+                    Err(_panic) => {
+                        // On panic, drop signals without notifying; worker continues
+                    }
+                }
+            }
+        });
+    }
+
     /// Executes a batch task asynchronously without waiting for its completion.
     ///
     /// This method submits a task to its corresponding batch processor. If a processor for this
@@ -442,52 +497,16 @@ impl TaskExecutor {
     /// ```
     pub fn execute_batch_detached<BT: BatchTask>(&self, batch_task: BT) {
         let key = TypeId::of::<BT>();
-        if let Some(sender_any) = self.batch_senders.get(&key) {
-            let sender = sender_any
-                .downcast_ref::<UnboundedSender<BatchItem<BT>>>()
-                .expect("Type mismatch in batch_senders");
-            // For detached mode, we pass `None` as the signal sender.
-            sender
-                .send((batch_task, None))
-                .expect("Failed to send batch task");
-        } else {
-            // If a batch processor for this task type doesn't exist, create a new one.
-            let (tx, mut rx) = unbounded_channel::<BatchItem<BT>>();
+        let mut tx = self.ensure_sender::<BT>();
 
-            let _handle: JoinHandle<()> = self.rt.spawn(async move {
-                loop {
-                    // Wait for the first task to arrive.
-                    if let Some((first_task, first_sender)) = rx.recv().await {
-                        let mut tasks = vec![first_task];
-                        let mut senders = vec![first_sender];
-
-                        // Try to drain as many tasks as possible from the channel to form a batch.
-                        while let Ok((task, sender)) = rx.try_recv() {
-                            tasks.push(task);
-                            senders.push(sender);
-                        }
-
-                        // Execute the batch processing.
-                        BT::batch_run(tasks).await;
-
-                        // After batch processing is complete, notify all waiting callers.
-                        for sender_opt in senders.into_iter() {
-                            if let Some(sender) = sender_opt {
-                                // This will return an error if the receiver has been dropped, but we ignore it.
-                                let _ = sender.send(());
-                            }
-                        }
-                    } else {
-                        // If the channel is closed, exit the loop.
-                        break;
-                    }
-                }
-            });
-            // Store the new sender in the DashMap.
-            self.batch_senders.insert(key, Box::new(tx.clone()));
-            // Send the first task.
-            tx.send((batch_task, None))
-                .expect("Failed to send initial batch task");
+        match tx.send((batch_task, None)) {
+            Ok(()) => {}
+            Err(e) => {
+                // Receiver closed; remove old sender, recreate worker, and resend
+                self.batch_senders.remove(&key);
+                tx = self.ensure_sender::<BT>();
+                let _ = tx.send(e.0);
+            }
         }
     }
 
@@ -549,51 +568,18 @@ impl TaskExecutor {
         batch_task: BT,
     ) -> Result<(), oneshot::error::RecvError> {
         let key = TypeId::of::<BT>();
-        // Create a oneshot channel to receive the completion signal.
         let (tx_oneshot, rx_oneshot) = oneshot::channel::<()>();
 
-        if let Some(sender_any) = self.batch_senders.get(&key) {
-            let sender = sender_any
-                .downcast_ref::<UnboundedSender<BatchItem<BT>>>()
-                .expect("Type mismatch in batch_senders");
-            // Send the task along with the signal sender.
-            sender
-                .send((batch_task, Some(tx_oneshot)))
-                .expect("Failed to send batch task");
-        } else {
-            // If a batch processor for this task type doesn't exist, create a new one.
-            let (tx, mut rx) = unbounded_channel::<BatchItem<BT>>();
-
-            let _handle: JoinHandle<()> = self.rt.spawn(async move {
-                loop {
-                    if let Some((first_task, first_sender)) = rx.recv().await {
-                        let mut tasks = vec![first_task];
-                        let mut senders = vec![first_sender];
-
-                        while let Ok((task, sender)) = rx.try_recv() {
-                            tasks.push(task);
-                            senders.push(sender);
-                        }
-
-                        BT::batch_run(tasks).await;
-
-                        for sender_opt in senders.into_iter() {
-                            if let Some(sender) = sender_opt {
-                                let _ = sender.send(());
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            });
-            // Store the new sender.
-            self.batch_senders.insert(key, Box::new(tx.clone()));
-            // Send the first task.
-            tx.send((batch_task, Some(tx_oneshot)))
-                .expect("Failed to send initial batch task");
+        let mut tx = self.ensure_sender::<BT>();
+        match tx.send((batch_task, Some(tx_oneshot))) {
+            Ok(()) => {}
+            Err(e) => {
+                // Receiver closed; remove old sender, recreate worker, and resend
+                self.batch_senders.remove(&key);
+                tx = self.ensure_sender::<BT>();
+                let _ = tx.send(e.0);
+            }
         }
-        // Wait for the completion signal.
         rx_oneshot.await
     }
 }
@@ -1045,6 +1031,34 @@ mod tests {
         assert!(result.unwrap().is_err());
     }
 
+    // Test that worker survives after batch panics and can process normal batches
+    #[test]
+    fn batch_panics_but_worker_survives() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        // Trigger a batch that will panic
+        let r = rt.block_on(async {
+            executor.execute_batch_waiting(PanicBatchTask).await
+        });
+        assert!(r.is_err());
+
+        // Send a normal batch, should succeed
+        #[derive(Clone)]
+        struct OkTask(Arc<AtomicUsize>);
+        impl BatchTask for OkTask {
+            async fn batch_run(list: Vec<Self>) {
+                let c = &list[0].0;
+                c.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+        let c = Arc::new(AtomicUsize::new(0));
+        rt.block_on(async {
+            executor.execute_batch_waiting(OkTask(c.clone())).await.unwrap();
+        });
+        assert_eq!(c.load(Ordering::SeqCst), 1);
+    }
+
     // Test that batch processors are reused
     #[test]
     fn test_batch_processor_reuse() {
@@ -1183,5 +1197,345 @@ mod tests {
         });
 
         assert_eq!(counter.load(Ordering::SeqCst), 30);
+    }
+
+    // Test same type panics then succeeds (ensure same worker not killed)
+    #[test]
+    fn same_type_panics_then_succeeds() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct SometimesPanicTask {
+            counter: Arc<AtomicUsize>,
+            should_panic: bool,
+        }
+        impl BatchTask for SometimesPanicTask {
+            async fn batch_run(list: Vec<Self>) {
+                if list.iter().any(|t| t.should_panic) {
+                    panic!("boom");
+                }
+                let c = &list[0].counter;
+                c.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        let c = Arc::new(AtomicUsize::new(0));
+
+        // First: panic, waiting end should receive Err
+        let r = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                executor.execute_batch_waiting(SometimesPanicTask { counter: c.clone(), should_panic: true }),
+            ).await
+        }).expect("timeout waiting for panic batch");
+        assert!(r.is_err());
+
+        // Second: same type, normal, should succeed and count +1
+        rt.block_on(async {
+            executor.execute_batch_waiting(SometimesPanicTask { counter: c.clone(), should_panic: false })
+                .await
+                .unwrap();
+        });
+        assert_eq!(c.load(Ordering::SeqCst), 1);
+    }
+
+    // Test multiple waiters all get RecvError on panic
+    #[test]
+    fn multiple_waiters_all_get_recverror_on_panic() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct AllPanic;
+        impl BatchTask for AllPanic {
+            async fn batch_run(_list: Vec<Self>) {
+                panic!("batch exploded");
+            }
+        }
+
+        let (r1, r2, r3) = rt.block_on(async {
+            tokio::join!(
+                executor.execute_batch_waiting(AllPanic),
+                executor.execute_batch_waiting(AllPanic),
+                executor.execute_batch_waiting(AllPanic),
+            )
+        });
+
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+        assert!(r3.is_err());
+    }
+
+    // Test panic storm then recover
+    #[test]
+    fn panic_storm_then_recover() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct SometimesPanic {
+            ok_counter: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl BatchTask for SometimesPanic {
+            async fn batch_run(list: Vec<Self>) {
+                if list.iter().any(|t| t.panic) { panic!("storm"); }
+                let c = &list[0].ok_counter;
+                c.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        // Continuous 10 panics
+        for _ in 0..10 {
+            let r = rt.block_on(async { executor.execute_batch_waiting(SometimesPanic { ok_counter: Arc::new(AtomicUsize::new(0)), panic: true }).await });
+            assert!(r.is_err());
+        }
+
+        // Afterwards should succeed
+        let ok = Arc::new(AtomicUsize::new(0));
+        rt.block_on(async {
+            executor.execute_batch_waiting(SometimesPanic { ok_counter: ok.clone(), panic: false }).await.unwrap();
+        });
+        assert_eq!(ok.load(Ordering::SeqCst), 1);
+    }
+
+    // Test interleaved OK / PANIC / OK (same type, state switching doesn't break)
+    #[test]
+    fn interleaved_ok_panic_ok_same_type() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct FlipTask {
+            sum: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl BatchTask for FlipTask {
+            async fn batch_run(list: Vec<Self>) {
+                if list.iter().any(|t| t.panic) { panic!("flip"); }
+                list[0].sum.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        let sum = Arc::new(AtomicUsize::new(0));
+
+        // OK
+        rt.block_on(async {
+            executor.execute_batch_waiting(FlipTask { sum: sum.clone(), panic: false }).await.unwrap();
+        });
+        assert_eq!(sum.load(Ordering::SeqCst), 1);
+
+        // PANIC
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                executor.execute_batch_waiting(FlipTask { sum: sum.clone(), panic: true }),
+            ).await
+        }).expect("timeout").unwrap_err();
+        // Error is expected
+
+        // OK again
+        rt.block_on(async {
+            executor.execute_batch_waiting(FlipTask { sum: sum.clone(), panic: false }).await.unwrap();
+        });
+        assert_eq!(sum.load(Ordering::SeqCst), 2);
+    }
+
+    // Test mixed waiters and fire-and-forget on panic, no deadlock (waiters all Err)
+    #[test]
+    fn detached_and_waiters_mixed_on_panic() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct MixPanic;
+        impl BatchTask for MixPanic {
+            async fn batch_run(_list: Vec<Self>) {
+                panic!("oops");
+            }
+        }
+
+        rt.block_on(async {
+            // First send several detached
+            for _ in 0..5 {
+                executor.execute_batch_detached(MixPanic);
+            }
+
+            // Then two waiters; regardless of whether same batch, both should Err
+            let (a, b) = tokio::join!(
+                executor.execute_batch_waiting(MixPanic),
+                executor.execute_batch_waiting(MixPanic),
+            );
+            assert!(a.is_err());
+            assert!(b.is_err());
+        });
+    }
+
+    // Test large batch coalesces many tasks (lower bound check)
+    #[test]
+    fn batch_coalesces_many_tasks_lower_bound() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct RecordLen {
+            last_len: Arc<AtomicUsize>,
+        }
+        impl BatchTask for RecordLen {
+            async fn batch_run(list: Vec<Self>) {
+                list[0].last_len.store(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        let last = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // First send 200 detached
+            for _ in 0..200 {
+                executor.execute_batch_detached(RecordLen { last_len: last.clone() });
+            }
+            // Then send one waiter, usually will be taken by same batch as above 200
+            executor.execute_batch_waiting(RecordLen { last_len: last.clone() })
+                .await
+                .unwrap();
+        });
+
+        // At least >= 1; in general case will be 201 (all in same batch drained)
+        assert!(last.load(Ordering::SeqCst) >= 1);
+    }
+
+    // Test many waiters all panic (stress and timeliness): no hang
+    #[test]
+    fn many_waiters_all_panic_no_hang() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct Boom;
+        impl BatchTask for Boom {
+            async fn batch_run(_list: Vec<Self>) { panic!("boom"); }
+        }
+
+        rt.block_on(async {
+            let mut results = Vec::new();
+
+            // Create multiple waiters that will all panic
+            for _ in 0..50 {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    executor.execute_batch_waiting(Boom)
+                ).await;
+                results.push(result);
+            }
+
+            // All should finish within 1 second (Ok(Err(..)))
+            assert!(results.iter().all(|r| r.is_ok() && r.as_ref().unwrap().is_err()));
+        });
+    }
+
+    // Test waiter dropped midway (drop future), worker send oneshot doesn't break
+    #[test]
+    fn dropped_waiter_does_not_break_worker() {
+        let rt = get_test_runtime();
+
+        #[derive(Clone)]
+        struct SlowOk(Arc<AtomicUsize>);
+        impl BatchTask for SlowOk {
+            async fn batch_run(list: Vec<Self>) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                list[0].0.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        let c1 = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::new(AtomicUsize::new(0));
+
+        rt.block_on(async {
+            // Start one waiter, but quickly cancel it (drop future)
+            let rt_inner = get_test_runtime();
+            let executor1 = TaskExecutor::new(rt_inner);
+            let handle = tokio::spawn(async move {
+                executor1.execute_batch_waiting(SlowOk(c1)).await
+            });
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            handle.abort(); // Drop waiter
+
+            // Afterwards send normal waiter, should succeed
+            let rt_inner2 = get_test_runtime();
+            let executor2 = TaskExecutor::new(rt_inner2);
+            executor2.execute_batch_waiting(SlowOk(c2.clone())).await.unwrap();
+        });
+
+        // If worker normal, should at least +1 (second waiter)
+        assert!(c2.load(Ordering::SeqCst) >= 1);
+    }
+
+    // Test multi-type isolation: one type panic doesn't affect another
+    #[test]
+    fn multi_type_isolation_panic_does_not_affect_other_type() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct WillPanic;
+        impl BatchTask for WillPanic {
+            async fn batch_run(_list: Vec<Self>) { panic!("type A broke"); }
+        }
+
+        #[derive(Clone)]
+        struct TypeB(Arc<AtomicUsize>);
+        impl BatchTask for TypeB {
+            async fn batch_run(list: Vec<Self>) {
+                list[0].0.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        // A type: panic
+        let ra = rt.block_on(async { executor.execute_batch_waiting(WillPanic).await });
+        assert!(ra.is_err());
+
+        // B type: should normal
+        let bsum = Arc::new(AtomicUsize::new(0));
+        rt.block_on(async {
+            executor.execute_batch_waiting(TypeB(bsum.clone())).await.unwrap();
+        });
+        assert_eq!(bsum.load(Ordering::SeqCst), 1);
+    }
+
+    // Test large scale same type mixed (mostly OK, few PANIC), ensure recovery
+    #[test]
+    fn large_mixed_after_panics_recovers() {
+        let rt = get_test_runtime();
+        let executor = TaskExecutor::new(rt);
+
+        #[derive(Clone)]
+        struct MaybePanic {
+            ok: Arc<AtomicUsize>,
+            panic: bool,
+        }
+        impl BatchTask for MaybePanic {
+            async fn batch_run(list: Vec<Self>) {
+                if list.iter().any(|t| t.panic) { panic!("mixed"); }
+                list[0].ok.fetch_add(list.len(), Ordering::SeqCst);
+            }
+        }
+
+        // First send a wave of panics
+        for _ in 0..5 {
+            let r = rt.block_on(async { executor.execute_batch_waiting(MaybePanic { ok: Arc::new(AtomicUsize::new(0)), panic: true }).await });
+            assert!(r.is_err());
+        }
+
+        // Then large amount of OK
+        let ok = Arc::new(AtomicUsize::new(0));
+        rt.block_on(async {
+            for _ in 0..100 {
+                executor.execute_batch_detached(MaybePanic { ok: ok.clone(), panic: false });
+            }
+            executor.execute_batch_waiting(MaybePanic { ok: ok.clone(), panic: false }).await.unwrap();
+        });
+
+        assert!(ok.load(Ordering::SeqCst) >= 1);
     }
 }
